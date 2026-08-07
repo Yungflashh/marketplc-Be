@@ -14,6 +14,9 @@ const orderRoutes = require('./routes/order.route');
 const userRoutes = require('./routes/user.route');
 const adminTransactions = require('./routes/transactions.route');
 const adminNotifications = require('./routes/notification.routes');
+const chatRoutes = require('./routes/chat.route');
+const emailRoutes = require('./routes/email.route');
+const paymentMethodRoutes = require('./routes/paymentMethod.route');
 
 const app = express();
 
@@ -47,6 +50,9 @@ app.use('/api/orders', orderRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/admin', adminTransactions);
 app.use('/api/notifications', adminNotifications);
+app.use('/api/chat', chatRoutes);
+app.use('/api/admin/emails', emailRoutes);
+app.use('/api/payment-methods', paymentMethodRoutes);
 
 // Health check route
 app.get('/api/health', (req, res) => {
