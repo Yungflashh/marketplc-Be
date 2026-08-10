@@ -125,26 +125,33 @@ exports.resendOTP = async (req, res) => {
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email });
-    if (!user || !(await user.comparePassword(password))) {
+    const user = await User.findOne({ email }).select('+otp +otpExpires');
+
+    // Generic 401 only when the account truly doesn't exist — avoids leaking
+    // which emails are registered while still guiding real users.
+    if (!user) {
       return res.status(401).json({ success: false, message: 'Invalid email or password' });
     }
 
-    // Require OTP verification before login
+    // Verify-first: if the account isn't verified, always route the user to
+    // /verify-otp regardless of whether they typed the right password. This
+    // prevents the "wrong password"/"unverified" ambiguity that causes users
+    // to re-register.
     if (!user.isVerified) {
-      
-
-      const otp = await user.generateOTP(); // single call handles saving
-
-
-    // Send OTP email
-    await sendEmail(user.email, 'Verify Your Email - ShopLogsHere', otpEmail(otp));
-
-    console.log(otp);
+      const hasValidOtp = user.otp && user.otpExpires && user.otpExpires > new Date();
+      if (!hasValidOtp) {
+        const otp = await user.generateOTP();
+        await sendEmail(user.email, 'Verify Your Email - ShopLogsHere', otpEmail(otp));
+      }
       return res.status(403).json({
         success: false,
-        message: 'Please verify your account with the OTP sent to your email.'
+        message: 'Account not verified — please check your email for the verification code.'
       });
+    }
+
+    // Now check password for verified accounts.
+    if (!(await user.comparePassword(password))) {
+      return res.status(401).json({ success: false, message: 'Invalid email or password' });
     }
 
     if (!user.isActive) {
@@ -153,8 +160,8 @@ exports.login = async (req, res) => {
 
     const token = generateToken(user._id);
 
-    // Send login alert email
-    await sendEmail(user.email, 'New Login Detected', loginAlertEmail(user.name));
+    // Send login alert email (non-blocking — don't fail the login if email breaks)
+    sendEmail(user.email, 'New Login Detected', loginAlertEmail(user.name)).catch(() => {});
 
     res.json({
       success: true,
