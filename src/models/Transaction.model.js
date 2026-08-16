@@ -46,6 +46,11 @@ const transactionSchema = new mongoose.Schema({
   balanceAfter: {
     type: Number,
     required: true
+  },
+  rejectionReason: {
+    type: String,
+    trim: true,
+    default: ''
   }
 }, {
   timestamps: true

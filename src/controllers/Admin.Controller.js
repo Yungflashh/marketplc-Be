@@ -45,12 +45,21 @@ const getAllTransactions = async (req, res) => {
 const updateTransactionStatus = async (req, res) => {
   try {
     const { transactionId } = req.params;
-    const { status } = req.body;
+    const { status, rejectionReason } = req.body;
 
     if (!['completed', 'failed'].includes(status)) {
       return res.status(400).json({
         success: false,
         message: 'Invalid status. Must be either "completed" or "failed"'
+      });
+    }
+
+    const trimmedReason = typeof rejectionReason === 'string' ? rejectionReason.trim() : '';
+
+    if (status === 'failed' && !trimmedReason) {
+      return res.status(400).json({
+        success: false,
+        message: 'A rejection reason is required when rejecting a transaction'
       });
     }
 
@@ -69,12 +78,17 @@ const updateTransactionStatus = async (req, res) => {
       });
     }
 
-    // Update transaction status
     transaction.status = status;
+
+    if (status === 'failed') {
+      transaction.rejectionReason = trimmedReason;
+    } else {
+      transaction.rejectionReason = '';
+    }
 
     // If approved (completed), credit the user's wallet
     if (status === 'completed' && transaction.type === 'credit') {
-      const user = await User.findById(transaction.user);  // Changed from userId to user
+      const user = await User.findById(transaction.user);
       if (!user) {
         return res.status(404).json({
           success: false,
