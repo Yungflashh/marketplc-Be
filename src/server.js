@@ -22,10 +22,25 @@ const app = express();
 
 // Middleware
 const corsOptions = {
-  origin: ['http://localhost:5173', 'https://www.shoplogshere.com', 'https://shoplogshere.com'],
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://127.0.0.1:5173',
+    'http://127.0.0.1:5174',
+    'https://www.shoplogshere.com',
+    'https://shoplogshere.com',
+  ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Requested-With',
+    'Accept',
+    'Origin',
+    'Cache-Control',
+    'X-API-Key',
+  ],
 };
 
 app.use(cors(corsOptions));
