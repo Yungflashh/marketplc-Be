@@ -34,6 +34,24 @@ exports.authenticate = async (req, res, next) => {
       });
     }
 
+    // Auto-expire a ban whose window has passed, otherwise deny access.
+    if (user.isBanned) {
+      if (user.banExpiresAt && user.banExpiresAt <= new Date()) {
+        user.isBanned = false;
+        user.banExpiresAt = null;
+        user.banReason = '';
+        await user.save();
+      } else {
+        return res.status(403).json({
+          success: false,
+          message: user.banReason
+            ? `Your account is banned: ${user.banReason}`
+            : 'Your account is banned.',
+          banExpiresAt: user.banExpiresAt,
+        });
+      }
+    }
+
     // Attach user to request
     req.user = user;
     next();

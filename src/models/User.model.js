@@ -35,6 +35,32 @@ const userSchema = new mongoose.Schema({
     default: true
   },
 
+  // 🚫 Ban fields (temporary ban with expiry; distinct from isActive which is a hard deactivation)
+  isBanned: {
+    type: Boolean,
+    default: false
+  },
+  banExpiresAt: {
+    type: Date,
+    default: null
+  },
+  banReason: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+
+  // ⚠️ Fraud/warning tracking
+  failedTransactionCount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  lastWarningEmailAt: {
+    type: Date,
+    default: null
+  },
+
   // 🔐 OTP fields
   otp: {
     type: String,
