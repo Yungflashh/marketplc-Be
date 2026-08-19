@@ -1,6 +1,10 @@
 // controllers/adminController.js
 const Transaction = require('../models/Transaction.model');
 const User = require('../models/User.model');
+const { sendEmail } = require('../utils/email');
+const { fraudWarningEmail } = require('../emails/fraudWarningEmail');
+
+const WARNING_EMAIL_SUBJECT = 'Important account warning — ShopLogs';
 
 // Get All Transactions (Admin)
 
@@ -13,7 +17,7 @@ const getAllTransactions = async (req, res) => {
     if (type) query.type = type;
 
     const transactions = await Transaction.find(query)
-      .populate('user', 'name email')  // Changed from userId to user
+      .populate('user', 'name email isBanned banExpiresAt failedTransactionCount lastWarningEmailAt')
       .sort({ createdAt: -1 })
       .limit(parseInt(limit))
       .skip((parseInt(page) - 1) * parseInt(limit));
@@ -86,28 +90,36 @@ const updateTransactionStatus = async (req, res) => {
       transaction.rejectionReason = '';
     }
 
-    // If approved (completed), credit the user's wallet
-    if (status === 'completed' && transaction.type === 'credit') {
-      const user = await User.findById(transaction.user);
-      if (!user) {
-        return res.status(404).json({
-          success: false,
-          message: 'User not found'
-        });
-      }
-
-      user.walletBalance += transaction.amount;
-      transaction.balanceAfter = user.walletBalance;
-      await user.save();
+    // Load the owning user once so we can update wallet AND fraud counter atomically.
+    const owner = await User.findById(transaction.user);
+    if (!owner) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
     }
 
+    if (status === 'completed') {
+      if (transaction.type === 'credit') {
+        owner.walletBalance += transaction.amount;
+        transaction.balanceAfter = owner.walletBalance;
+      }
+      // Approval is a positive signal — reset the consecutive-failure streak.
+      owner.failedTransactionCount = 0;
+    } else if (status === 'failed' && transaction.type === 'credit') {
+      // Only funding rejections count toward the fraud streak.
+      owner.failedTransactionCount = (owner.failedTransactionCount || 0) + 1;
+    }
+
+    await owner.save();
     await transaction.save();
 
     res.status(200).json({
       success: true,
       message: `Transaction ${status === 'completed' ? 'approved' : 'rejected'} successfully`,
       data: {
-        transaction
+        transaction,
+        userFailedTransactionCount: owner.failedTransactionCount || 0,
       }
     });
   } catch (error) {
@@ -178,8 +190,147 @@ const getDashboardStats = async (req, res) => {
   }
 };
 
+// ============================================================
+// Ban / Unban a user
+// ============================================================
+const banUser = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { days, reason } = req.body;
+
+    const numericDays = Number(days);
+    if (!Number.isFinite(numericDays) || numericDays <= 0 || numericDays > 3650) {
+      return res.status(400).json({
+        success: false,
+        message: 'Ban duration must be between 1 and 3650 days',
+      });
+    }
+
+    const trimmedReason = typeof reason === 'string' ? reason.trim() : '';
+    if (!trimmedReason) {
+      return res.status(400).json({
+        success: false,
+        message: 'A ban reason is required',
+      });
+    }
+
+    const user = await User.findById(id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    if (user.role === 'admin') {
+      return res.status(400).json({ success: false, message: 'Admin accounts cannot be banned' });
+    }
+
+    const expires = new Date(Date.now() + numericDays * 24 * 60 * 60 * 1000);
+    user.isBanned = true;
+    user.banExpiresAt = expires;
+    user.banReason = trimmedReason;
+    await user.save();
+
+    res.json({
+      success: true,
+      message: `User banned for ${numericDays} day${numericDays === 1 ? '' : 's'}`,
+      data: { user },
+    });
+  } catch (error) {
+    console.error('Ban user error:', error);
+    res.status(500).json({ success: false, message: 'Error banning user' });
+  }
+};
+
+const unbanUser = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const user = await User.findById(id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    user.isBanned = false;
+    user.banExpiresAt = null;
+    user.banReason = '';
+    // Give the user a clean slate on unban.
+    user.failedTransactionCount = 0;
+    await user.save();
+
+    res.json({ success: true, message: 'User unbanned', data: { user } });
+  } catch (error) {
+    console.error('Unban user error:', error);
+    res.status(500).json({ success: false, message: 'Error unbanning user' });
+  }
+};
+
+// ============================================================
+// Fraud warning email — preview + send
+// ============================================================
+const buildWarningEmail = (user) => {
+  const failedCount = user.failedTransactionCount || 0;
+  return {
+    subject: WARNING_EMAIL_SUBJECT,
+    html: fraudWarningEmail({ name: user.name, failedCount }),
+    to: user.email,
+    failedCount,
+  };
+};
+
+const previewWarningEmail = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const user = await User.findById(id).select('name email failedTransactionCount lastWarningEmailAt');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const preview = buildWarningEmail(user);
+    res.json({
+      success: true,
+      data: {
+        subject: preview.subject,
+        html: preview.html,
+        to: preview.to,
+        failedCount: preview.failedCount,
+        lastWarningEmailAt: user.lastWarningEmailAt,
+      },
+    });
+  } catch (error) {
+    console.error('Preview warning email error:', error);
+    res.status(500).json({ success: false, message: 'Error building preview' });
+  }
+};
+
+const sendWarningEmail = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const user = await User.findById(id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const { subject, html } = buildWarningEmail(user);
+    await sendEmail(user.email, subject, html);
+
+    user.lastWarningEmailAt = new Date();
+    await user.save();
+
+    res.json({
+      success: true,
+      message: `Warning email sent to ${user.email}`,
+      data: { user },
+    });
+  } catch (error) {
+    console.error('Send warning email error:', error);
+    res.status(500).json({ success: false, message: 'Error sending warning email' });
+  }
+};
+
 module.exports = {
   getAllTransactions,
   updateTransactionStatus,
-  getDashboardStats
+  getDashboardStats,
+  banUser,
+  unbanUser,
+  previewWarningEmail,
+  sendWarningEmail,
 };
