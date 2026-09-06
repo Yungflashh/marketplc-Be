@@ -1,6 +1,9 @@
 const Product = require('../models/Product.model');
 const cloudinary = require('../config/cloudinary');
+const { notify, escapeHtml } = require('../utils/telegram');
 
+const LOW_STOCK_THRESHOLD = 3;
+const ADMIN_BASE = process.env.ADMIN_BASE_URL || '';
 
 // Create new product (Admin only)
 
@@ -27,6 +30,13 @@ exports.createProduct = async (req, res) => {
       imageUrl,
       createdBy: req.user._id,
     });
+
+    notify(
+      `🆕 <b>Product created</b>\n` +
+        `${escapeHtml(product.name)} · $${Number(product.price).toFixed(2)}\n` +
+        `Stock: ${product.quantity} · Category: ${escapeHtml(product.category || '—')}\n` +
+        `By: ${escapeHtml(req.user.name)}`
+    );
 
     res.status(201).json({
       success: true,
@@ -140,6 +150,15 @@ exports.updateProduct = async (req, res) => {
       });
     }
 
+    // Capture pre-update snapshot for diff notification
+    const before = {
+      name: product.name,
+      price: product.price,
+      quantity: product.quantity,
+      category: product.category,
+      isActive: product.isActive,
+    };
+
     // Upload new image if provided
     if (req.file) {
       const uploaded = await cloudinary.uploader.upload(req.file.path, {
@@ -151,12 +170,47 @@ exports.updateProduct = async (req, res) => {
     // Update fields
     if (name !== undefined) product.name = name;
     if (description !== undefined) product.description = description;
-    if (price !== undefined) product.price = price;
-    if (quantity !== undefined) product.quantity = quantity;
+    if (price !== undefined) product.price = Number(price);
+    if (quantity !== undefined) product.quantity = Number(quantity);
     if (category !== undefined) product.category = category;
     if (isActive !== undefined) product.isActive = isActive;
 
     await product.save();
+
+    // Build diff for notification
+    const changes = [];
+    if (before.name !== product.name) changes.push(`name: ${escapeHtml(before.name)} → ${escapeHtml(product.name)}`);
+    if (before.price !== product.price) {
+      const delta = product.price - before.price;
+      const arrow = delta > 0 ? '⬆️' : '⬇️';
+      changes.push(`price: $${before.price.toFixed(2)} → $${product.price.toFixed(2)} ${arrow}`);
+    }
+    if (before.quantity !== product.quantity) {
+      const restocked = product.quantity > before.quantity ? ' ↑' : '';
+      changes.push(`stock: ${before.quantity} → ${product.quantity}${restocked}`);
+    }
+    if (before.category !== product.category) changes.push(`category: ${escapeHtml(before.category || '—')} → ${escapeHtml(product.category || '—')}`);
+    if (before.isActive !== product.isActive) changes.push(`active: ${before.isActive} → ${product.isActive}`);
+    if (req.file) changes.push('image replaced');
+
+    if (changes.length) {
+      const isPriceChange = before.price !== product.price;
+      notify(
+        `✏️ <b>Product updated</b>\n` +
+          `${escapeHtml(product.name)}\n` +
+          changes.map((c) => `• ${c}`).join('\n') +
+          `\nBy: ${escapeHtml(req.user.name)}`,
+        { severity: isPriceChange ? 'warn' : 'info' }
+      );
+    }
+
+    // Low-stock alert
+    if (product.isActive && product.quantity <= LOW_STOCK_THRESHOLD && before.quantity > LOW_STOCK_THRESHOLD) {
+      notify(
+        `📉 <b>Low stock</b>\n${escapeHtml(product.name)} · <b>${product.quantity}</b> left`,
+        { severity: 'warn' }
+      );
+    }
 
     res.json({
       success: true,
@@ -184,7 +238,15 @@ exports.deleteProduct = async (req, res) => {
       });
     }
 
+    const snapshot = { name: product.name, price: product.price };
     await product.deleteOne();
+
+    notify(
+      `🗑️ <b>Product deleted</b>\n` +
+        `${escapeHtml(snapshot.name)} · $${Number(snapshot.price).toFixed(2)}\n` +
+        `By: ${escapeHtml(req.user.name)}`,
+      { severity: 'warn' }
+    );
 
     res.json({
       success: true,
@@ -230,6 +292,9 @@ exports.toggleFeatured = async (req, res) => {
     if (!product) return res.status(404).json({ success: false, message: 'Product not found' });
     product.featured = !product.featured;
     await product.save();
+    notify(
+      `⭐ <b>Product ${product.featured ? 'featured' : 'unfeatured'}</b>\n${escapeHtml(product.name)}`
+    );
     res.json({ success: true, message: `Product ${product.featured ? 'marked as featured' : 'removed from featured'}`, data: { product } });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Error toggling featured', error: error.message });

@@ -4,6 +4,10 @@ const User = require('../models/User.model');
 const Transaction = require('../models/Transaction.model');
 const { notify, escapeHtml } = require('../utils/telegram');
 const { createUserNotification } = require('../utils/userNotify');
+const { sendEmail } = require('../utils/email');
+const { orderStatusEmail } = require('../emails/orderStatusEmail');
+
+const ADMIN_BASE = process.env.ADMIN_BASE_URL || '';
 
 // Generate unique transaction reference
 const generateReference = () => {
@@ -115,7 +119,27 @@ exports.createOrder = async (req, res) => {
       .populate('user', 'name email')
       .populate('items.product', 'name imageUrl');
 
-    notify(`🧾 <b>New order</b>\n#${order.orderNumber}\n${escapeHtml(user.name)} · ${orderItems.length} item(s) · <b>$${totalAmount.toFixed(2)}</b>`);
+    // Lifetime order count for context (this one is the Nth)
+    const lifetimeOrders = await Order.countDocuments({ user: user._id });
+    const ordinal = ['1st', '2nd', '3rd'][lifetimeOrders - 1] || `${lifetimeOrders}th`;
+
+    const itemLines = orderItems
+      .map((i) => `  • ${escapeHtml(i.productName)} × ${i.quantity} — $${i.subtotal.toFixed(2)}`)
+      .join('\n');
+
+    const buttons = ADMIN_BASE
+      ? [{ text: '📦 View order', url: `${ADMIN_BASE}/orders/${order._id}` }]
+      : undefined;
+
+    notify(
+      `🧾 <b>New order</b> · #${order.orderNumber}\n` +
+        `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n` +
+        `Customer's <b>${ordinal}</b> order\n` +
+        `${orderItems.length} item(s) · <b>$${totalAmount.toFixed(2)}</b>\n\n` +
+        itemLines + `\n\n` +
+        `Wallet used: $${totalAmount.toFixed(2)} (balance $${balanceBefore.toFixed(2)} → $${user.walletBalance.toFixed(2)})`,
+      { buttons }
+    );
 
     res.status(201).json({
       success: true,
@@ -215,12 +239,21 @@ const ORDER_STATUSES = ['pending', 'in-review', 'processing', 'completed', 'canc
 
 exports.updateOrderStatus = async (req, res) => {
   try {
-    const { status } = req.body;
+    const { status, rejectionReason } = req.body;
 
     if (!status || !ORDER_STATUSES.includes(status)) {
       return res.status(400).json({
         success: false,
         message: `status must be one of: ${ORDER_STATUSES.join(', ')}`
+      });
+    }
+
+    // Cancelling an order requires an explicit reason (mirrors funding rejection)
+    const trimmedReason = typeof rejectionReason === 'string' ? rejectionReason.trim() : '';
+    if (status === 'cancelled' && !trimmedReason) {
+      return res.status(400).json({
+        success: false,
+        message: 'A reason is required when cancelling an order',
       });
     }
 
@@ -241,21 +274,97 @@ exports.updateOrderStatus = async (req, res) => {
 
     const oldStatus = order.status;
     order.status = status;
+    if (status === 'cancelled') {
+      order.rejectionReason = trimmedReason;
+    }
+    order.statusHistory = order.statusHistory || [];
+    order.statusHistory.push({
+      status,
+      changedAt: new Date(),
+      changedBy: req.user?._id,
+      reason: status === 'cancelled' ? trimmedReason : '',
+    });
+
+    // On cancellation, refund the wallet + restock inventory. Guarded by `refunded`
+    // so double-refunds can't happen even if this endpoint is hit twice.
+    let refundAmount = 0;
+    if (status === 'cancelled' && !order.refunded) {
+      const owner = await User.findById(order.user);
+      if (owner) {
+        const balanceBefore = owner.walletBalance || 0;
+        owner.walletBalance = balanceBefore + order.totalAmount;
+        await owner.save();
+
+        await Transaction.create({
+          user: owner._id,
+          type: 'credit',
+          amount: order.totalAmount,
+          description: `Refund for cancelled order ${order.orderNumber}`,
+          status: 'completed',
+          paymentMethod: 'wallet',
+          reference: `REFUND-${order.orderNumber}-${Date.now()}`,
+          balanceBefore,
+          balanceAfter: owner.walletBalance,
+          relatedOrder: order._id,
+        });
+
+        // Restock the products the cancelled order held
+        for (const item of order.items) {
+          await Product.findByIdAndUpdate(item.product, {
+            $inc: { quantity: item.quantity },
+          });
+        }
+
+        order.refunded = true;
+        refundAmount = order.totalAmount;
+      }
+    }
     await order.save();
 
     const populated = await Order.findById(order._id)
       .populate('user', 'name email')
       .populate('items.product', 'name imageUrl');
 
-    notify(`📦 <b>Order status</b>\n#${order.orderNumber}: ${escapeHtml(oldStatus)} → <b>${escapeHtml(status)}</b>`);
+    const buttons = ADMIN_BASE
+      ? [{ text: '📦 View order', url: `${ADMIN_BASE}/orders/${order._id}` }]
+      : undefined;
+    const severity = status === 'cancelled' ? 'warn' : 'info';
+    notify(
+      `📦 <b>Order status</b>\n#${order.orderNumber}: ${escapeHtml(oldStatus)} → <b>${escapeHtml(status)}</b>\n` +
+        `${escapeHtml(populated.user?.name || '')} · $${order.totalAmount.toFixed(2)}` +
+        (status === 'cancelled' ? `\nReason: ${escapeHtml(trimmedReason)}` : '') +
+        (refundAmount ? `\nRefunded: <b>$${refundAmount.toFixed(2)}</b>` : ''),
+      { severity, buttons }
+    );
 
+    // In-app notification (includes the reason when cancelled)
     createUserNotification({
       userId: order.user,
       type: 'order_status',
       title: `Order #${order.orderNumber} is now ${status}`,
-      body: `Your order has moved from ${oldStatus} to ${status}.`,
+      body: status === 'cancelled'
+        ? `Cancelled — ${trimmedReason}${refundAmount ? ` · $${refundAmount.toFixed(2)} refunded to your wallet.` : ''}`
+        : `Your order has moved from ${oldStatus} to ${status}.`,
       link: `/order/${order._id}`,
     });
+
+    // Email the user about the status change (non-blocking — order update still succeeds
+    // if Resend is temporarily down)
+    if (populated.user?.email) {
+      sendEmail(
+        populated.user.email,
+        `Order ${order.orderNumber} — ${status}`,
+        orderStatusEmail({
+          name: populated.user.name,
+          orderNumber: order.orderNumber,
+          oldStatus,
+          newStatus: status,
+          totalAmount: order.totalAmount,
+          reason: status === 'cancelled' ? trimmedReason : '',
+          refundAmount,
+        })
+      ).catch(() => {}); // email.js already notifies Telegram on failure
+    }
 
     res.json({
       success: true,

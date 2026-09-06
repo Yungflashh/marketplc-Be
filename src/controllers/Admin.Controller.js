@@ -120,7 +120,19 @@ const updateTransactionStatus = async (req, res) => {
     await transaction.save();
 
     const verb = status === 'completed' ? 'approved ✅' : 'rejected ❌';
-    notify(`💸 <b>Funding ${verb}</b>\n${escapeHtml(owner.name)} · $${transaction.amount.toFixed(2)}\nRef: <code>${escapeHtml(transaction.reference)}</code>${status === 'failed' && trimmedReason ? `\nReason: ${escapeHtml(trimmedReason)}` : ''}`);
+    const adminBase = process.env.ADMIN_BASE_URL || '';
+    const buttons = adminBase
+      ? [{ text: '👤 View user', url: `${adminBase}/users/${owner._id}` }]
+      : undefined;
+    notify(
+      `💸 <b>Funding ${verb}</b>\n` +
+        `${escapeHtml(owner.name)} · $${transaction.amount.toFixed(2)}\n` +
+        `Ref: <code>${escapeHtml(transaction.reference)}</code>\n` +
+        `New balance: $${(owner.walletBalance || 0).toFixed(2)}` +
+        (status === 'failed' && trimmedReason ? `\nReason: ${escapeHtml(trimmedReason)}` : '') +
+        (status === 'failed' ? `\nFailed streak: <b>${owner.failedTransactionCount || 0}</b>` : ''),
+      { buttons }
+    );
 
     createUserNotification({
       userId: owner._id,
@@ -344,9 +356,36 @@ const banUser = async (req, res) => {
     user.isBanned = true;
     user.banExpiresAt = expires;
     user.banReason = trimmedReason;
+    user.banHistory = user.banHistory || [];
+    user.banHistory.push({
+      bannedAt: new Date(),
+      bannedUntil: expires,
+      days: numericDays,
+      reason: trimmedReason,
+      bannedBy: req.user?._id,
+    });
     await user.save();
 
-    notify(`🚫 <b>User banned</b>\n${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n${numericDays} day(s)\nReason: ${escapeHtml(trimmedReason)}`);
+    // Lifetime spend from completed order debits
+    const spendAgg = await Transaction.aggregate([
+      { $match: { user: user._id, type: 'debit', status: 'completed' } },
+      { $group: { _id: null, total: { $sum: '$amount' } } },
+    ]);
+    const lifetimeSpend = spendAgg[0]?.total || 0;
+    const accountAgeDays = Math.floor((Date.now() - new Date(user.createdAt).getTime()) / (24 * 60 * 60 * 1000));
+    const priorBans = Math.max(0, (user.banHistory?.length || 0) - 1);
+
+    notify(
+      `🚫 <b>User banned</b>\n` +
+        `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n` +
+        `${numericDays} day(s)\n` +
+        `Reason: ${escapeHtml(trimmedReason)}\n\n` +
+        `Prior bans: <b>${priorBans}</b>\n` +
+        `Account age: ${accountAgeDays} day(s)\n` +
+        `Lifetime spend: $${lifetimeSpend.toFixed(2)}\n` +
+        `Wallet balance: $${(user.walletBalance || 0).toFixed(2)}`,
+      { severity: 'alert' }
+    );
 
     res.json({
       success: true,
@@ -373,6 +412,10 @@ const unbanUser = async (req, res) => {
     // Give the user a clean slate on unban.
     user.failedTransactionCount = 0;
     await user.save();
+
+    notify(
+      `✅ <b>User unbanned</b>\n${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;`
+    );
 
     res.json({ success: true, message: 'User unbanned', data: { user } });
   } catch (error) {

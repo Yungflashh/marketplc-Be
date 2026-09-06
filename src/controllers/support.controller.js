@@ -1,6 +1,7 @@
 const SupportChat = require('../models/SupportChat.model');
 const SupportMessage = require('../models/SupportMessage.model');
 const { notify, sendAndReturnId, escapeHtml, isConfigured } = require('../utils/telegram');
+const { extract, renderBlock } = require('../utils/requestContext');
 
 const MAX_MESSAGE_LENGTH = 2000;
 
@@ -40,12 +41,29 @@ exports.sendMessage = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Message text is required' });
     }
 
+    const priorMessageCount = await SupportMessage.countDocuments({
+      chat: { $in: await SupportChat.find({ sessionId }).distinct('_id') },
+    });
+    const isNewSession = priorMessageCount === 0;
+
     const chat = await findOrCreateChat({
       sessionId,
       user: req.user,
       visitorName,
       visitorEmail,
     });
+
+    // Fire a "new chat opened" ping before we forward the first message.
+    if (isNewSession) {
+      const ctxNew = extract(req);
+      notify(
+        `💭 <b>New support chat opened</b>\n` +
+          `Session: <code>${escapeHtml(sessionId.slice(0, 8))}</code>\n` +
+          (req.user ? `User: ${escapeHtml(req.user.name)} &lt;${escapeHtml(req.user.email)}&gt;\n` : 'Guest visitor\n') +
+          (req.body?.currentPath ? `Page: ${escapeHtml(req.body.currentPath)}\n` : '') +
+          `\n` + renderBlock(ctxNew)
+      );
+    }
 
     // Persist visitor message first so it appears immediately even if Telegram fails
     const message = await SupportMessage.create({
@@ -54,12 +72,34 @@ exports.sendMessage = async (req, res) => {
       text: trimmed,
     });
 
+    // Nth message in this chat
+    const msgNumber = (await SupportMessage.countDocuments({ chat: chat._id })) || 1;
+
+    // Priors: has this visitor chatted before?
+    const priorChatCount = req.user
+      ? await SupportChat.countDocuments({ user: req.user._id, _id: { $ne: chat._id } })
+      : 0;
+
+    const ctx = extract(req);
+    const geoLine = ctx.geo
+      ? `\n📍 ${escapeHtml([ctx.geo.city, ctx.geo.country].filter(Boolean).join(', '))}`
+      : '';
+    const currentPath = String(req.body?.currentPath || req.headers.referer || '').slice(0, 120);
+
     // Forward to admin's Telegram. Long-press-reply → routed back via webhook.
     const identity = chat.user
       ? `User: ${escapeHtml(chat.visitorName || '')} &lt;${escapeHtml(chat.visitorEmail || '')}&gt;`
       : `Guest ${escapeHtml(chat.sessionId.slice(0, 8))}${chat.visitorName ? ` · ${escapeHtml(chat.visitorName)}` : ''}${chat.visitorEmail ? ` · ${escapeHtml(chat.visitorEmail)}` : ''}`;
 
-    const tgText = `💬 <b>Support message</b>\n${identity}\n\n${escapeHtml(trimmed)}\n\n<i>Long-press &amp; Reply to answer.</i>`;
+    const meta = [`#${msgNumber} in session`];
+    if (priorChatCount > 0) meta.push(`${priorChatCount} prior chat(s)`);
+    if (currentPath) meta.push(`from ${escapeHtml(currentPath)}`);
+
+    const tgText =
+      `💬 <b>Support message</b>\n${identity}${geoLine}\n` +
+      `<i>${meta.join(' · ')}</i>\n\n` +
+      `${escapeHtml(trimmed)}\n\n` +
+      `<i>Long-press &amp; Reply to answer.</i>`;
     const telegramMessageId = await sendAndReturnId(tgText);
 
     if (telegramMessageId) {

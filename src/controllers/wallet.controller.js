@@ -3,6 +3,7 @@ const Transaction = require('../models/Transaction.model');
 const User = require('../models/User.model');
 const crypto = require('crypto');
 const { notify, escapeHtml } = require('../utils/telegram');
+const { extract, renderBlock } = require('../utils/requestContext');
 
 // Generate unique reference
 const generateReference = () => {
@@ -51,7 +52,30 @@ const fundWallet = async (req, res) => {
       balanceAfter: user.walletBalance // Balance unchanged until approved
     });
 
-    notify(`💰 <b>Funding request</b>\n${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n<b>$${Number(amount).toFixed(2)}</b> via ${escapeHtml(paymentMethod)}\nRef: <code>${escapeHtml(transaction.reference)}</code>`);
+    // Lifetime deposit stats for context
+    const [completedCreditAgg, completedCreditCount] = await Promise.all([
+      Transaction.aggregate([
+        { $match: { user: user._id, type: 'credit', status: 'completed' } },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]),
+      Transaction.countDocuments({ user: user._id, type: 'credit', status: 'completed' }),
+    ]);
+    const lifetimeDeposits = completedCreditAgg[0]?.total || 0;
+    const firstTimerBadge = completedCreditCount === 0 ? '🆕 <b>First-time depositor</b>\n' : '';
+
+    const ctx = extract(req);
+    const ctxBlock = renderBlock(ctx);
+
+    notify(
+      `💰 <b>Funding request</b>\n` +
+        firstTimerBadge +
+        `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n` +
+        `<b>$${Number(amount).toFixed(2)}</b> via ${escapeHtml(paymentMethod)}\n` +
+        `Ref: <code>${escapeHtml(transaction.reference)}</code>\n` +
+        `Current balance: $${(user.walletBalance || 0).toFixed(2)}\n` +
+        `Lifetime deposits: $${lifetimeDeposits.toFixed(2)} (${completedCreditCount})` +
+        (ctxBlock ? `\n\n${ctxBlock}` : '')
+    );
 
     res.status(201).json({
       success: true,

@@ -121,6 +121,39 @@ const userSchema = new mongoose.Schema({
   isVerified: {
     type: Boolean,
     default: false
+  },
+
+  // 📍 Optional contact info (populated via profile update)
+  phone: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+  address: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+
+  // 🔑 Login history for new-device / new-country detection
+  lastLoginAt: { type: Date, default: null },
+  lastLoginIp: { type: String, default: '' },
+  lastLoginCountry: { type: String, default: '' },
+  knownDeviceHashes: {
+    type: [String],
+    default: []
+  },
+
+  // 🚫 Ban history (each ban gets pushed here on ban action)
+  banHistory: {
+    type: [{
+      bannedAt: { type: Date, default: Date.now },
+      bannedUntil: { type: Date },
+      days: { type: Number },
+      reason: { type: String, trim: true, default: '' },
+      bannedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+    }],
+    default: []
   }
 
 }, {

@@ -1,5 +1,6 @@
 const Wishlist = require('../models/Wishlist.model');
 const Product = require('../models/Product.model');
+const { notify, escapeHtml } = require('../utils/telegram');
 
 const populatedWishlist = (userId) =>
   Wishlist.findOne({ user: userId }).populate('items.product');
@@ -48,6 +49,12 @@ exports.addItem = async (req, res) => {
     if (!alreadyIn) {
       wishlist.items.push({ product: productId, addedAt: new Date() });
       await wishlist.save();
+
+      notify(
+        `❤️ <b>Wishlist add</b>\n` +
+          `${escapeHtml(req.user.name)}: ${escapeHtml(product.name)} · $${Number(product.price).toFixed(2)}\n` +
+          `Wishlist now: <b>${wishlist.items.length}</b> item(s)`
+      );
     }
 
     const fresh = await populatedWishlist(req.user._id);

@@ -23,7 +23,16 @@ const supportRoutes = require('./routes/support.route');
 const trackRoutes = require('./routes/track.route');
 const inboxRoutes = require('./routes/userNotification.route');
 
+const { notify, escapeHtml, isConfigured, formatTimestamp } = require('./utils/telegram');
+const { extract, renderBlock } = require('./utils/requestContext');
+const abandonmentJob = require('./jobs/abandonment.job');
+const analyticsJob = require('./jobs/analytics.job');
+
 const app = express();
+
+// Trust the first proxy hop (Render, Vercel, etc.) so req.ip and rate limiters
+// see the real client IP from X-Forwarded-For.
+app.set('trust proxy', 1);
 
 // Middleware
 const corsOptions = {
@@ -60,7 +69,13 @@ mongoose.connect(process.env.MONGODB_URI, {
   useUnifiedTopology: true,
 })
 .then(() => console.log('MongoDB connected successfully'))
-.catch((err) => console.error('MongoDB connection error:', err));
+.catch((err) => {
+  console.error('MongoDB connection error:', err);
+  notify(
+    `💥 <b>MongoDB connection failed</b>\nError: ${escapeHtml(err.message)}`,
+    { severity: 'alert' }
+  );
+});
 
 // Routes
 app.use('/api/auth', authRoutes);
@@ -84,18 +99,76 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'Server is running' });
 });
 
-// Error handling middleware
+// Debounce repeat 500s from the same route so a broken endpoint doesn't spam.
+const recentErrorAlerts = new Map();
+const ERROR_COOLDOWN_MS = 2 * 60 * 1000;
+const shouldAlertError = (key) => {
+  const last = recentErrorAlerts.get(key) || 0;
+  if (Date.now() - last < ERROR_COOLDOWN_MS) return false;
+  recentErrorAlerts.set(key, Date.now());
+  return true;
+};
+
+// Error handling middleware — also forwards uncaught exceptions to Telegram
 app.use((err, req, res, next) => {
   console.error(err.stack);
-  res.status(500).json({ 
-    success: false, 
+  try {
+    const route = `${req.method} ${req.originalUrl || req.url || ''}`;
+    if (shouldAlertError(route)) {
+      const ctx = extract(req);
+      const userLine = req.user
+        ? `\nUser: ${escapeHtml(req.user.name || '')} &lt;${escapeHtml(req.user.email || '')}&gt;`
+        : '';
+      notify(
+        `💥 <b>Uncaught server error</b>\n` +
+          `<code>${escapeHtml(route)}</code>${userLine}\n\n` +
+          `<b>${escapeHtml(err.message || 'unknown')}</b>\n` +
+          `<pre>${escapeHtml(String(err.stack || '').slice(0, 400))}</pre>\n\n` +
+          renderBlock(ctx),
+        { severity: 'alert' }
+      );
+    }
+  } catch (e) {
+    console.warn('error-notify failed:', e.message);
+  }
+  res.status(500).json({
+    success: false,
     message: 'Something went wrong!',
     error: process.env.NODE_ENV === 'development' ? err.message : {}
   });
+});
+
+// Also catch async errors thrown outside express context.
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandledRejection:', reason);
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  notify(
+    `💥 <b>Unhandled promise rejection</b>\n${escapeHtml(msg).slice(0, 400)}`,
+    { severity: 'alert' }
+  );
+});
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException:', err);
+  notify(
+    `💥 <b>Uncaught exception</b>\n${escapeHtml(err.message || String(err)).slice(0, 400)}`,
+    { severity: 'alert' }
+  );
 });
 
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
+  // Bootstrap ping — confirms telegram is wired end-to-end on each deploy.
+  if (isConfigured()) {
+    notify(
+      `🚀 <b>Server started</b>\n` +
+        `Port: ${PORT}\n` +
+        `Env: ${escapeHtml(process.env.NODE_ENV || 'production')}\n` +
+        `Time: ${formatTimestamp()}`
+    );
+  }
+  // Kick off scheduled jobs.
+  abandonmentJob.start();
+  analyticsJob.start();
 });

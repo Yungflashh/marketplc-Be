@@ -1,4 +1,5 @@
 const { notify, escapeHtml } = require('../utils/telegram');
+const { extract, renderBlock } = require('../utils/requestContext');
 
 // 60-second per-IP dedupe. In-memory Map (single-instance).
 // For multi-instance deploys, swap for Redis.
@@ -15,9 +16,8 @@ setInterval(gc, 60 * 1000).unref?.();
 
 exports.visit = (req, res) => {
   try {
-    const ip = (req.headers['x-forwarded-for']?.split(',')[0].trim())
-      || req.socket?.remoteAddress
-      || 'unknown';
+    const ctx = extract(req);
+    const ip = ctx.ip;
 
     const now = Date.now();
     const last = recentIps.get(ip);
@@ -26,14 +26,13 @@ exports.visit = (req, res) => {
     }
     recentIps.set(ip, now);
 
-    const ua = String(req.headers['user-agent'] || 'unknown').slice(0, 240);
-    const referrer = String(req.body?.referrer || req.headers.referer || '').slice(0, 240);
     const path = String(req.body?.path || '').slice(0, 240);
+    const ctxBlock = renderBlock(ctx);
 
     notify(
-      `👀 <b>Visitor</b>\nIP: <code>${escapeHtml(ip)}</code>\nUA: ${escapeHtml(ua)}${
-        path ? `\nPath: ${escapeHtml(path)}` : ''
-      }${referrer ? `\nRef: ${escapeHtml(referrer)}` : ''}`
+      `👀 <b>Visitor</b>\n` +
+        (path ? `Path: ${escapeHtml(path)}\n` : '') +
+        ctxBlock
     );
 
     res.json({ success: true, deduped: false });

@@ -174,7 +174,7 @@ Audience note: ${audienceHint || 'general shoppers'}.`;
         response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: prompt.slice(0, 2000) },
+          { role: 'user', content: prompt.slice(0, 8000) },
         ],
       }),
     });

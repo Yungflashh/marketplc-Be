@@ -2,6 +2,13 @@ const Cart = require('../models/Cart.model');
 const Product = require('../models/Product.model');
 const { notify, escapeHtml } = require('../utils/telegram');
 
+const cartTotals = (cart) => {
+  const items = (cart.items || []).filter((i) => i.product && i.product.price != null);
+  const itemCount = items.reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const total = items.reduce((sum, i) => sum + (i.quantity || 0) * (i.product.price || 0), 0);
+  return { itemCount, total };
+};
+
 const populatedCart = (userId) =>
   Cart.findOne({ user: userId }).populate('items.product');
 
@@ -54,9 +61,15 @@ exports.addItem = async (req, res) => {
     }
     await cart.save();
 
-    notify(`🛒 <b>Add to cart</b>\n${escapeHtml(req.user.name)}: ${qty}× ${escapeHtml(product.name)} · $${product.price.toFixed(2)}`);
-
     const fresh = await populatedCart(req.user._id);
+    const { itemCount, total } = cartTotals(fresh);
+
+    notify(
+      `🛒 <b>Add to cart</b>\n` +
+        `${escapeHtml(req.user.name)}: ${qty}× ${escapeHtml(product.name)} · $${product.price.toFixed(2)}\n` +
+        `Cart now: <b>${itemCount}</b> item(s) · <b>$${total.toFixed(2)}</b>`
+    );
+
     res.json({ success: true, data: { cart: serializeCart(fresh) } });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Error adding item', error: error.message });

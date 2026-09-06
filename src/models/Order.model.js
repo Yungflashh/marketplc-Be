@@ -57,6 +57,24 @@ const orderSchema = new mongoose.Schema({
     type: String,
     enum: ['wallet'],
     default: 'wallet'
+  },
+  rejectionReason: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+  refunded: {
+    type: Boolean,
+    default: false
+  },
+  statusHistory: {
+    type: [{
+      status: { type: String },
+      changedAt: { type: Date, default: Date.now },
+      changedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+      reason: { type: String, default: '' },
+    }],
+    default: []
   }
 }, {
   timestamps: true

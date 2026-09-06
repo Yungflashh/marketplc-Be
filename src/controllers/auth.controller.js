@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User.model');
 const Transaction = require('../models/Transaction.model');
+const Order = require('../models/Order.model');
 const { sendEmail } = require('../utils/email');
 const { welcomeEmail } = require('../emails/welcomeEmail');
 const { loginAlertEmail } = require('../emails/loginAlertEmail');
@@ -8,6 +9,8 @@ const { otpEmail } = require('../emails/otpEmail');
 const { forgotPasswordEmail } = require('../emails/forgotPasswordEmail');
 const { notify, escapeHtml } = require('../utils/telegram');
 const { createUserNotification } = require('../utils/userNotify');
+const { extract, renderBlock, deviceFingerprint } = require('../utils/requestContext');
+const failedLogin = require('../utils/failedLoginTracker');
 
 const WELCOME_BONUS_AMOUNT = Number(process.env.WELCOME_BONUS_AMOUNT) || 5;
 const REFERRAL_REWARD_AMOUNT = Number(process.env.REFERRAL_REWARD_AMOUNT) || 5;
@@ -65,7 +68,12 @@ const awardReferralReward = async (newUser) => {
     link: '/wallet',
   });
 
-  notify(`🤝 <b>Referral reward</b>\n${escapeHtml(referrer.name)} earned $${REFERRAL_REWARD_AMOUNT} — ${escapeHtml(newUser.email)} joined via their code.`);
+  notify(
+    `🤝 <b>Referral reward</b>\n` +
+      `${escapeHtml(referrer.name)} earned $${REFERRAL_REWARD_AMOUNT}\n` +
+      `Invitee: ${escapeHtml(newUser.email)}\n` +
+      `Total referrals: <b>${referrer.referralRewardCount}</b> · New balance: $${referrer.walletBalance.toFixed(2)}`
+  );
 };
 
 // Generate JWT token
@@ -79,7 +87,7 @@ const generateToken = (id) => {
 exports.register = async (req, res) => {
 
   console.log("trying to login");
-  
+
   try {
     const { name, email, password, role, referralCode } = req.body;
 
@@ -93,10 +101,12 @@ exports.register = async (req, res) => {
 
     // If a referral code was supplied, look up the referrer (case-insensitive)
     let referredBy = null;
+    let referrerNameForNote = null;
     if (referralCode && typeof referralCode === 'string') {
-      const referrer = await User.findOne({ referralCode: referralCode.trim().toUpperCase() }).select('_id email');
+      const referrer = await User.findOne({ referralCode: referralCode.trim().toUpperCase() }).select('_id email name');
       if (referrer && referrer.email !== email) {
         referredBy = referrer._id;
+        referrerNameForNote = referrer.name;
       }
     }
 
@@ -116,7 +126,15 @@ exports.register = async (req, res) => {
 
     console.log(otp);
 
-    notify(`🆕 <b>Signup started</b>\n${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n<i>Waiting for OTP verification…</i>`);
+    const ctx = extract(req);
+    const ctxBlock = renderBlock(ctx);
+    notify(
+      `🆕 <b>Signup started</b>\n` +
+        `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n` +
+        (referrerNameForNote ? `Referred by: <b>${escapeHtml(referrerNameForNote)}</b>\n` : '') +
+        (ctxBlock ? `\n${ctxBlock}\n` : '') +
+        `\n<i>Waiting for OTP verification…</i>`
+    );
 
     res.status(201).json({
       success: true,
@@ -138,7 +156,7 @@ exports.register = async (req, res) => {
 exports.verifyOTP = async (req, res) => {
 
   console.log("It got here ooo");
-  
+
   try {
     const { email, otp } = req.body;
 
@@ -149,9 +167,18 @@ exports.verifyOTP = async (req, res) => {
 
     const isValid = await user.verifyOTP(otp);
     if (!isValid) {
+      const misses = failedLogin.bump('otp', email);
+      if (misses >= 3) {
+        notify(
+          `❌ <b>OTP failures</b>\n${escapeHtml(email)}\n<b>${misses}</b> wrong codes in a row.`,
+          { severity: 'warn' }
+        );
+      }
       return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
     }
 
+    failedLogin.reset('otp', email);
+    failedLogin.reset('otpResend', email);
     await user.save();
 
     // First-time verification → grant welcome bonus (idempotent)
@@ -172,7 +199,14 @@ exports.verifyOTP = async (req, res) => {
       }
     }
 
-    notify(`✅ <b>Signup verified</b>\n${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n$${WELCOME_BONUS_AMOUNT} welcome bonus credited.`);
+    const ctx = extract(req);
+    const ctxBlock = renderBlock(ctx);
+    notify(
+      `✅ <b>Signup verified</b>\n` +
+        `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n` +
+        `$${WELCOME_BONUS_AMOUNT} welcome bonus credited.` +
+        (ctxBlock ? `\n\n${ctxBlock}` : '')
+    );
 
     // Send welcome email after successful verification
     await sendEmail(user.email, 'Welcome to ShopWithLogsHere 🎉', welcomeEmail(user.name));
@@ -246,6 +280,16 @@ exports.requestEmailChange = async (req, res) => {
 
     await sendEmail(trimmed, 'Confirm your new ShopLogs email', otpEmail(otp));
 
+    const ctx = extract(req);
+    notify(
+      `📧 <b>Email change requested</b>\n` +
+        `${escapeHtml(user.name)}\n` +
+        `Old: ${escapeHtml(user.email)}\n` +
+        `New: ${escapeHtml(trimmed)}\n\n` +
+        renderBlock(ctx),
+      { severity: 'warn' }
+    );
+
     res.json({
       success: true,
       message: 'A verification code was sent to your new email. Enter it to confirm the change.',
@@ -288,11 +332,18 @@ exports.confirmEmailChange = async (req, res) => {
       return res.status(400).json({ success: false, message: 'That email was taken while you waited' });
     }
 
+    const oldEmail = user.email;
     user.email = user.pendingEmail;
     user.pendingEmail = null;
     user.pendingEmailOtp = null;
     user.pendingEmailOtpExpires = null;
     await user.save();
+
+    notify(
+      `✅ <b>Email changed</b>\n` +
+        `${escapeHtml(user.name)}\n` +
+        `${escapeHtml(oldEmail)} → <b>${escapeHtml(user.email)}</b>`
+    );
 
     res.json({
       success: true,
@@ -339,6 +390,14 @@ exports.resendOTP = async (req, res) => {
       return res.status(400).json({ success: false, message: 'User already verified' });
     }
 
+    const resendCount = failedLogin.bump('otpResend', email);
+    if (resendCount >= 4) {
+      notify(
+        `♻️ <b>OTP resend spam</b>\n${escapeHtml(email)}\n<b>${resendCount}</b> resends in the last 15 min.`,
+        { severity: 'warn' }
+      );
+    }
+
     const otp = await user.generateOTP(); // single call handles saving
 
 
@@ -359,10 +418,21 @@ exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
     const user = await User.findOne({ email }).select('+otp +otpExpires');
+    const ctx = extract(req);
 
     // Generic 401 only when the account truly doesn't exist — avoids leaking
     // which emails are registered while still guiding real users.
     if (!user) {
+      const fails = failedLogin.bump('login', email || ctx.ip);
+      if (fails >= 5) {
+        notify(
+          `🚫 <b>Failed logins</b>\n` +
+            `Email: ${escapeHtml(email || '(none)')}\n` +
+            `<b>${fails}</b> attempts in 15 min.\n\n` +
+            renderBlock(ctx),
+          { severity: 'alert' }
+        );
+      }
       return res.status(401).json({ success: false, message: 'Invalid email or password' });
     }
 
@@ -384,6 +454,16 @@ exports.login = async (req, res) => {
 
     // Now check password for verified accounts.
     if (!(await user.comparePassword(password))) {
+      const fails = failedLogin.bump('login', user.email);
+      if (fails >= 3) {
+        notify(
+          `🔓 <b>Wrong password</b>\n` +
+            `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n` +
+            `<b>${fails}</b> failed attempts in a row.\n\n` +
+            renderBlock(ctx),
+          { severity: 'warn' }
+        );
+      }
       return res.status(401).json({ success: false, message: 'Invalid email or password' });
     }
 
@@ -408,12 +488,43 @@ exports.login = async (req, res) => {
       }
     }
 
+    const priorFailCount = failedLogin.peek('login', user.email);
+    failedLogin.reset('login', user.email);
+
+    // Detect new device / new country BEFORE mutating user record
+    const fingerprint = deviceFingerprint(req);
+    const knownDevices = user.knownDeviceHashes || [];
+    const isNewDevice = !knownDevices.includes(fingerprint);
+    const currentCountry = ctx.geo?.country || '';
+    const isNewCountry = currentCountry && user.lastLoginCountry && currentCountry !== user.lastLoginCountry;
+
+    // Update login tracking
+    user.lastLoginAt = new Date();
+    user.lastLoginIp = ctx.ip;
+    user.lastLoginCountry = currentCountry || user.lastLoginCountry;
+    if (isNewDevice && fingerprint) {
+      // Keep list bounded — most recent 20 devices
+      user.knownDeviceHashes = [fingerprint, ...knownDevices].slice(0, 20);
+    }
+    await user.save();
+
     const token = generateToken(user._id);
 
-    const ip = (req.headers['x-forwarded-for']?.split(',')[0].trim())
-      || req.socket?.remoteAddress
-      || 'unknown';
-    notify(`🔑 <b>Login</b>\n${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\nIP: <code>${escapeHtml(ip)}</code>`);
+    const ctxBlock = renderBlock(ctx);
+    const flags = [];
+    if (isNewDevice) flags.push('🆕 new device');
+    if (isNewCountry) flags.push(`🌍 new country (was ${escapeHtml(user.lastLoginCountry || 'unknown')})`);
+    if (priorFailCount > 0) flags.push(`⚠️ succeeded after ${priorFailCount} failed attempt(s)`);
+    const flagLine = flags.length ? `\n${flags.join(' · ')}` : '';
+
+    const severity = isNewCountry || priorFailCount >= 3 ? 'warn' : 'info';
+    notify(
+      `🔑 <b>Login</b>\n` +
+        `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;` +
+        flagLine +
+        (ctxBlock ? `\n\n${ctxBlock}` : ''),
+      { severity }
+    );
 
     // Send login alert email (non-blocking — don't fail the login if email breaks)
     sendEmail(user.email, 'New Login Detected', loginAlertEmail(user.name)).catch(() => {});
@@ -461,6 +572,14 @@ exports.forgotPassword = async (req, res) => {
     const otp = await user.generateOTP();
     await sendEmail(email, 'Reset Your Password — ShopLogs', forgotPasswordEmail(user.name, otp));
 
+    const ctx = extract(req);
+    notify(
+      `🔐 <b>Password reset requested</b>\n` +
+        `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n\n` +
+        renderBlock(ctx),
+      { severity: 'warn' }
+    );
+
     res.json({ success: true, message: 'Password reset code sent to your email.' });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Error sending reset email', error: error.message });
@@ -483,11 +602,26 @@ exports.resetPassword = async (req, res) => {
 
     const isValid = await user.verifyOTP(otp);
     if (!isValid) {
+      const misses = failedLogin.bump('otp', email);
+      if (misses >= 3) {
+        notify(
+          `❌ <b>OTP failures (reset)</b>\n${escapeHtml(email)}\n<b>${misses}</b> wrong codes.`,
+          { severity: 'warn' }
+        );
+      }
       return res.status(400).json({ success: false, message: 'Invalid or expired reset code' });
     }
 
+    failedLogin.reset('otp', email);
     user.password = newPassword;
     await user.save();
+
+    const ctx = extract(req);
+    notify(
+      `✅ <b>Password reset completed</b>\n` +
+        `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n\n` +
+        renderBlock(ctx)
+    );
 
     res.json({ success: true, message: 'Password reset successfully. You can now log in.' });
   } catch (error) {
@@ -498,15 +632,53 @@ exports.resetPassword = async (req, res) => {
 // ========================== UPDATE PROFILE ==========================
 exports.updateProfile = async (req, res) => {
   try {
-    const { name } = req.body;
-    if (!name || name.trim().length < 2) {
-      return res.status(400).json({ success: false, message: 'Name must be at least 2 characters' });
+    const { name, phone, address } = req.body;
+    const updates = {};
+
+    if (name !== undefined) {
+      if (!name || name.trim().length < 2) {
+        return res.status(400).json({ success: false, message: 'Name must be at least 2 characters' });
+      }
+      updates.name = name.trim();
     }
+    if (phone !== undefined) updates.phone = String(phone).trim();
+    if (address !== undefined) updates.address = String(address).trim();
+
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({ success: false, message: 'Nothing to update' });
+    }
+
+    const before = await User.findById(req.user._id).select('name phone address');
     const user = await User.findByIdAndUpdate(
       req.user._id,
-      { name: name.trim() },
+      updates,
       { new: true }
     ).select('-password');
+
+    // Detect what actually changed for the Telegram note
+    const changedFields = [];
+    if (updates.name && updates.name !== before.name) changedFields.push(`name`);
+    if (updates.phone !== undefined && updates.phone !== (before.phone || '')) changedFields.push(`phone`);
+    if (updates.address !== undefined && updates.address !== (before.address || '')) changedFields.push(`address`);
+
+    // Detect first-time profile completion (address + phone set for the first time)
+    const nowHasBoth = user.phone && user.address;
+    const hadBoth = before.phone && before.address;
+    if (nowHasBoth && !hadBoth) {
+      notify(
+        `🎯 <b>Profile completed</b>\n` +
+          `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n` +
+          `📞 ${escapeHtml(user.phone)}\n` +
+          `📍 ${escapeHtml(user.address)}`
+      );
+    } else if (changedFields.length) {
+      notify(
+        `📝 <b>Profile updated</b>\n` +
+          `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n` +
+          `Changed: ${escapeHtml(changedFields.join(', '))}`
+      );
+    }
+
     res.json({ success: true, message: 'Profile updated successfully', data: { user } });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Error updating profile', error: error.message });
@@ -526,6 +698,15 @@ exports.changePassword = async (req, res) => {
     }
     user.password = newPassword;
     await user.save();
+
+    const ctx = extract(req);
+    notify(
+      `🔑 <b>Password changed</b>\n` +
+        `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n\n` +
+        renderBlock(ctx),
+      { severity: 'warn' }
+    );
+
     res.json({ success: true, message: 'Password changed successfully' });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Error changing password', error: error.message });
@@ -550,6 +731,12 @@ exports.promoteToAdmin = async (req, res) => {
     if (!user) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
+
+    notify(
+      `👑 <b>Promoted to admin</b>\n` +
+        `${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;`,
+      { severity: 'alert' }
+    );
 
     res.json({
       success: true,
