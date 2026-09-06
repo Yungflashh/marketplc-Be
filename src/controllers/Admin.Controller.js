@@ -1,8 +1,13 @@
 // controllers/adminController.js
+const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction.model');
 const User = require('../models/User.model');
+const Product = require('../models/Product.model');
+const Order = require('../models/Order.model');
 const { sendEmail } = require('../utils/email');
 const { fraudWarningEmail } = require('../emails/fraudWarningEmail');
+const { notify, escapeHtml } = require('../utils/telegram');
+const { createUserNotification } = require('../utils/userNotify');
 
 const WARNING_EMAIL_SUBJECT = 'Important account warning — ShopLogs';
 
@@ -114,6 +119,21 @@ const updateTransactionStatus = async (req, res) => {
     await owner.save();
     await transaction.save();
 
+    const verb = status === 'completed' ? 'approved ✅' : 'rejected ❌';
+    notify(`💸 <b>Funding ${verb}</b>\n${escapeHtml(owner.name)} · $${transaction.amount.toFixed(2)}\nRef: <code>${escapeHtml(transaction.reference)}</code>${status === 'failed' && trimmedReason ? `\nReason: ${escapeHtml(trimmedReason)}` : ''}`);
+
+    createUserNotification({
+      userId: owner._id,
+      type: status === 'completed' ? 'funding_approved' : 'funding_rejected',
+      title: status === 'completed'
+        ? `$${transaction.amount.toFixed(2)} credited to your wallet`
+        : `Funding request was rejected`,
+      body: status === 'completed'
+        ? `Your funding request has been approved. Ref: ${transaction.reference}`
+        : `Reason: ${trimmedReason || 'No reason provided'}`,
+      link: `/wallet`,
+    });
+
     res.status(200).json({
       success: true,
       message: `Transaction ${status === 'completed' ? 'approved' : 'rejected'} successfully`,
@@ -132,60 +152,157 @@ const updateTransactionStatus = async (req, res) => {
 };
 
 // Get Dashboard Stats (Admin)
+const LOW_STOCK_THRESHOLD = 3;
+const EXPIRING_BAN_WINDOW_HOURS = 48;
+
+const startOfDay = (date) => {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+
 const getDashboardStats = async (req, res) => {
   try {
-    const Product = require('../models/Product');
-    const Order = require('../models/Order');
+    const now = new Date();
+    const todayStart = startOfDay(now);
+    const yesterdayStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
+    const thirtyDaysAgo = new Date(todayStart.getTime() - 29 * 24 * 60 * 60 * 1000);
+    const expiringBanCutoff = new Date(now.getTime() + EXPIRING_BAN_WINDOW_HOURS * 60 * 60 * 1000);
 
-    const [products, orders, transactions] = await Promise.all([
+    const [
+      totalProducts,
+      totalOrders,
+      totalUsers,
+      revenueAgg,
+      avgItemsAgg,
+      walletLiabilityAgg,
+      todayOrdersAgg,
+      yesterdayOrdersAgg,
+      todaySignups,
+      yesterdaySignups,
+      pendingTransactionsCount,
+      pendingOrdersCount,
+      lowStockProducts,
+      expiringBans,
+      revenueTrendAgg,
+    ] = await Promise.all([
       Product.countDocuments(),
       Order.countDocuments(),
-      Transaction.aggregate([
+      User.countDocuments(),
+      Order.aggregate([
+        { $match: { status: 'completed' } },
+        { $group: { _id: null, totalRevenue: { $sum: '$totalAmount' } } },
+      ]),
+      Order.aggregate([
+        { $project: { itemCount: { $sum: '$items.quantity' } } },
+        { $group: { _id: null, avg: { $avg: '$itemCount' } } },
+      ]),
+      User.aggregate([
+        { $group: { _id: null, total: { $sum: '$walletBalance' } } },
+      ]),
+      Order.aggregate([
+        { $match: { createdAt: { $gte: todayStart } } },
+        { $group: { _id: null, count: { $sum: 1 }, revenue: { $sum: '$totalAmount' } } },
+      ]),
+      Order.aggregate([
+        { $match: { createdAt: { $gte: yesterdayStart, $lt: todayStart } } },
+        { $group: { _id: null, count: { $sum: 1 }, revenue: { $sum: '$totalAmount' } } },
+      ]),
+      User.countDocuments({ createdAt: { $gte: todayStart } }),
+      User.countDocuments({ createdAt: { $gte: yesterdayStart, $lt: todayStart } }),
+      Transaction.countDocuments({ status: 'pending' }),
+      Order.countDocuments({ status: 'pending' }),
+      Product.find({ isActive: true, quantity: { $lte: LOW_STOCK_THRESHOLD } })
+        .select('name quantity price imageUrl category')
+        .sort({ quantity: 1 })
+        .limit(5)
+        .lean(),
+      User.find({
+        isBanned: true,
+        banExpiresAt: { $gt: now, $lte: expiringBanCutoff },
+      })
+        .select('name email banExpiresAt banReason')
+        .sort({ banExpiresAt: 1 })
+        .limit(5)
+        .lean(),
+      Order.aggregate([
+        { $match: { createdAt: { $gte: thirtyDaysAgo } } },
         {
           $group: {
-            _id: '$status',
-            count: { $sum: 1 },
-            totalAmount: { $sum: '$amount' }
-          }
-        }
-      ])
+            _id: {
+              $dateToString: { format: '%Y-%m-%d', date: '$createdAt' },
+            },
+            orders: { $sum: 1 },
+            revenue: { $sum: '$totalAmount' },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
     ]);
 
-    const completedOrders = await Order.aggregate([
-      { $match: { status: 'completed' } },
-      { $group: { _id: null, totalRevenue: { $sum: '$totalAmount' } } }
-    ]);
+    // Fill in missing days so the chart always has exactly 30 buckets
+    const trendMap = new Map(revenueTrendAgg.map((d) => [d._id, d]));
+    const revenueTrend = [];
+    for (let i = 0; i < 30; i++) {
+      const d = new Date(thirtyDaysAgo.getTime() + i * 24 * 60 * 60 * 1000);
+      const key = d.toISOString().slice(0, 10);
+      const bucket = trendMap.get(key);
+      revenueTrend.push({
+        date: key,
+        orders: bucket?.orders || 0,
+        revenue: bucket?.revenue || 0,
+      });
+    }
 
-    const transactionStats = {
-      total: 0,
-      pending: 0,
-      completed: 0,
-      failed: 0,
-      totalAmount: 0
+    const totalRevenue = revenueAgg[0]?.totalRevenue || 0;
+    const avgItemsPerOrder = avgItemsAgg[0]?.avg || 0;
+    const walletLiability = walletLiabilityAgg[0]?.total || 0;
+    const today = {
+      orders: todayOrdersAgg[0]?.count || 0,
+      revenue: todayOrdersAgg[0]?.revenue || 0,
+      signups: todaySignups,
+    };
+    const yesterday = {
+      orders: yesterdayOrdersAgg[0]?.count || 0,
+      revenue: yesterdayOrdersAgg[0]?.revenue || 0,
+      signups: yesterdaySignups,
     };
 
-    transactions.forEach(stat => {
-      transactionStats.total += stat.count;
-      transactionStats[stat._id] = stat.count;
-      if (stat._id === 'completed') {
-        transactionStats.totalAmount = stat.totalAmount;
-      }
-    });
+    const systemHealth = [
+      { name: 'MongoDB', ok: mongoose.connection.readyState === 1 },
+      { name: 'Groq API', ok: !!process.env.GROQ_API_KEY },
+      { name: 'Resend email', ok: !!process.env.RESEND_API_KEY },
+    ];
 
     res.status(200).json({
       success: true,
       data: {
-        totalProducts: products,
-        totalOrders: orders,
-        totalRevenue: completedOrders[0]?.totalRevenue || 0,
-        transactions: transactionStats
-      }
+        totals: {
+          products: totalProducts,
+          orders: totalOrders,
+          users: totalUsers,
+          revenue: totalRevenue,
+          avgItemsPerOrder,
+          avgOrderValue: totalOrders > 0 ? totalRevenue / totalOrders : 0,
+          walletLiability,
+        },
+        today,
+        yesterday,
+        queues: {
+          pendingTransactionsCount,
+          pendingOrdersCount,
+          lowStockProducts,
+          expiringBans,
+        },
+        revenueTrend,
+        systemHealth,
+      },
     });
   } catch (error) {
     console.error('Get dashboard stats error:', error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching dashboard stats'
+      message: 'Error fetching dashboard stats',
     });
   }
 };
@@ -228,6 +345,8 @@ const banUser = async (req, res) => {
     user.banExpiresAt = expires;
     user.banReason = trimmedReason;
     await user.save();
+
+    notify(`🚫 <b>User banned</b>\n${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n${numericDays} day(s)\nReason: ${escapeHtml(trimmedReason)}`);
 
     res.json({
       success: true,

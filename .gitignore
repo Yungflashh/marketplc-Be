@@ -40,3 +40,7 @@ temp/
 
 # Redis dump
 dump.rdb
+
+# Claude Code local state
+.claude/
+memory/

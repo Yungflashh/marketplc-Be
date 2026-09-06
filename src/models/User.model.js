@@ -61,6 +61,54 @@ const userSchema = new mongoose.Schema({
     default: null
   },
 
+  // 🎁 Welcome bonus tracking
+  welcomeBonusAwardedAt: {
+    type: Date,
+    default: null
+  },
+  welcomeBonusAcknowledged: {
+    type: Boolean,
+    default: false
+  },
+
+  // 🤝 Referral program
+  referralCode: {
+    type: String,
+    unique: true,
+    sparse: true,
+    uppercase: true,
+    index: true
+  },
+  referredBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+    index: true
+  },
+  referralRewardCount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+
+  // 📧 Pending email change (OTP-gated)
+  pendingEmail: {
+    type: String,
+    lowercase: true,
+    trim: true,
+    default: null
+  },
+  pendingEmailOtp: {
+    type: String,
+    select: false,
+    default: null
+  },
+  pendingEmailOtpExpires: {
+    type: Date,
+    select: false,
+    default: null
+  },
+
   // 🔐 OTP fields
   otp: {
     type: String,
@@ -90,6 +138,32 @@ userSchema.pre('save', async function(next) {
   } catch (error) {
     next(error);
   }
+});
+
+// Auto-generate a referral code if missing. Retry on duplicate.
+const REFERRAL_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0,1,O,I
+const genReferralCode = () => {
+  let code = '';
+  for (let i = 0; i < 8; i++) {
+    code += REFERRAL_ALPHABET[Math.floor(Math.random() * REFERRAL_ALPHABET.length)];
+  }
+  return code;
+};
+
+userSchema.pre('save', async function(next) {
+  if (this.referralCode) return next();
+  const Model = this.constructor;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const candidate = genReferralCode();
+    const clash = await Model.findOne({ referralCode: candidate }).select('_id').lean();
+    if (!clash) {
+      this.referralCode = candidate;
+      return next();
+    }
+  }
+  // fallback: append random suffix to make virtually collision-free
+  this.referralCode = genReferralCode() + Date.now().toString(36).slice(-3).toUpperCase();
+  next();
 });
 
 // Compare passwords
@@ -129,6 +203,8 @@ userSchema.methods.toJSON = function() {
   delete obj.password;
   delete obj.otp;
   delete obj.otpExpires;
+  delete obj.pendingEmailOtp;
+  delete obj.pendingEmailOtpExpires;
   return obj;
 };
 

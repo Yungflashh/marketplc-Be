@@ -2,6 +2,7 @@
 const Transaction = require('../models/Transaction.model');
 const User = require('../models/User.model');
 const crypto = require('crypto');
+const { notify, escapeHtml } = require('../utils/telegram');
 
 // Generate unique reference
 const generateReference = () => {
@@ -49,6 +50,8 @@ const fundWallet = async (req, res) => {
       balanceBefore: user.walletBalance,  // Added balanceBefore
       balanceAfter: user.walletBalance // Balance unchanged until approved
     });
+
+    notify(`💰 <b>Funding request</b>\n${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n<b>$${Number(amount).toFixed(2)}</b> via ${escapeHtml(paymentMethod)}\nRef: <code>${escapeHtml(transaction.reference)}</code>`);
 
     res.status(201).json({
       success: true,

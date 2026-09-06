@@ -17,6 +17,11 @@ const adminNotifications = require('./routes/notification.routes');
 const chatRoutes = require('./routes/chat.route');
 const emailRoutes = require('./routes/email.route');
 const paymentMethodRoutes = require('./routes/paymentMethod.route');
+const cartRoutes = require('./routes/cart.route');
+const wishlistRoutes = require('./routes/wishlist.route');
+const supportRoutes = require('./routes/support.route');
+const trackRoutes = require('./routes/track.route');
+const inboxRoutes = require('./routes/userNotification.route');
 
 const app = express();
 
@@ -68,6 +73,11 @@ app.use('/api/notifications', adminNotifications);
 app.use('/api/chat', chatRoutes);
 app.use('/api/admin/emails', emailRoutes);
 app.use('/api/payment-methods', paymentMethodRoutes);
+app.use('/api/cart', cartRoutes);
+app.use('/api/wishlist', wishlistRoutes);
+app.use('/api/support', supportRoutes);
+app.use('/api/track', trackRoutes);
+app.use('/api/inbox', inboxRoutes);
 
 // Health check route
 app.get('/api/health', (req, res) => {

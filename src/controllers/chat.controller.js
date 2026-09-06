@@ -1,7 +1,7 @@
 const Product = require('../models/Product.model');
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
 const MAX_HISTORY = 20;
 const MAX_USER_MESSAGE_LENGTH = 2000;
 const PRODUCT_CONTEXT_LIMIT = 40;

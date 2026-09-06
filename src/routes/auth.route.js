@@ -36,4 +36,14 @@ router.patch('/update-profile', authenticate, authController.updateProfile);
 // Change password
 router.patch('/change-password', authenticate, authController.changePassword);
 
+// Acknowledge welcome bonus (dismiss celebration banner)
+router.post('/acknowledge-welcome-bonus', authenticate, authController.acknowledgeWelcomeBonus);
+
+// Referral: get my code + stats
+router.get('/referral', authenticate, authController.getReferralInfo);
+
+// Change email (OTP-gated)
+router.post('/change-email/request', authenticate, authController.requestEmailChange);
+router.post('/change-email/confirm', authenticate, authController.confirmEmailChange);
+
 module.exports = router;

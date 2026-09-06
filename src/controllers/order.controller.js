@@ -2,6 +2,8 @@ const Order = require('../models/Order.model');
 const Product = require('../models/Product.model');
 const User = require('../models/User.model');
 const Transaction = require('../models/Transaction.model');
+const { notify, escapeHtml } = require('../utils/telegram');
+const { createUserNotification } = require('../utils/userNotify');
 
 // Generate unique transaction reference
 const generateReference = () => {
@@ -79,7 +81,6 @@ exports.createOrder = async (req, res) => {
       user: user._id,
       items: orderItems,
       totalAmount,
-      status: 'completed'
     });
 
     await order.save(); // Triggers pre-save hook to generate orderNumber
@@ -113,6 +114,8 @@ exports.createOrder = async (req, res) => {
     const populatedOrder = await Order.findById(order._id)
       .populate('user', 'name email')
       .populate('items.product', 'name imageUrl');
+
+    notify(`🧾 <b>New order</b>\n#${order.orderNumber}\n${escapeHtml(user.name)} · ${orderItems.length} item(s) · <b>$${totalAmount.toFixed(2)}</b>`);
 
     res.status(201).json({
       success: true,
@@ -202,6 +205,67 @@ exports.getOrderById = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Error fetching order',
+      error: error.message
+    });
+  }
+};
+
+// Update order status (Admin only)
+const ORDER_STATUSES = ['pending', 'in-review', 'processing', 'completed', 'cancelled'];
+
+exports.updateOrderStatus = async (req, res) => {
+  try {
+    const { status } = req.body;
+
+    if (!status || !ORDER_STATUSES.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `status must be one of: ${ORDER_STATUSES.join(', ')}`
+      });
+    }
+
+    const order = await Order.findById(req.params.id);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+
+    if (order.status === 'completed' || order.status === 'cancelled') {
+      return res.status(400).json({
+        success: false,
+        message: `Order is already ${order.status} and cannot be updated`
+      });
+    }
+
+    const oldStatus = order.status;
+    order.status = status;
+    await order.save();
+
+    const populated = await Order.findById(order._id)
+      .populate('user', 'name email')
+      .populate('items.product', 'name imageUrl');
+
+    notify(`📦 <b>Order status</b>\n#${order.orderNumber}: ${escapeHtml(oldStatus)} → <b>${escapeHtml(status)}</b>`);
+
+    createUserNotification({
+      userId: order.user,
+      type: 'order_status',
+      title: `Order #${order.orderNumber} is now ${status}`,
+      body: `Your order has moved from ${oldStatus} to ${status}.`,
+      link: `/order/${order._id}`,
+    });
+
+    res.json({
+      success: true,
+      message: `Order status updated to ${status}`,
+      data: { order: populated }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error updating order status',
       error: error.message
     });
   }

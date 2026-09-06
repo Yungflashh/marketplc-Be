@@ -1,10 +1,72 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User.model');
+const Transaction = require('../models/Transaction.model');
 const { sendEmail } = require('../utils/email');
 const { welcomeEmail } = require('../emails/welcomeEmail');
 const { loginAlertEmail } = require('../emails/loginAlertEmail');
 const { otpEmail } = require('../emails/otpEmail');
 const { forgotPasswordEmail } = require('../emails/forgotPasswordEmail');
+const { notify, escapeHtml } = require('../utils/telegram');
+const { createUserNotification } = require('../utils/userNotify');
+
+const WELCOME_BONUS_AMOUNT = Number(process.env.WELCOME_BONUS_AMOUNT) || 5;
+const REFERRAL_REWARD_AMOUNT = Number(process.env.REFERRAL_REWARD_AMOUNT) || 5;
+
+const awardWelcomeBonus = async (user) => {
+  if (user.welcomeBonusAwardedAt) return;
+  const balanceBefore = user.walletBalance || 0;
+  user.walletBalance = balanceBefore + WELCOME_BONUS_AMOUNT;
+  user.welcomeBonusAwardedAt = new Date();
+  await user.save();
+
+  await Transaction.create({
+    user: user._id,
+    type: 'credit',
+    amount: WELCOME_BONUS_AMOUNT,
+    description: 'Welcome bonus 🎉',
+    status: 'completed',
+    paymentMethod: 'wallet',
+    reference: `WELCOME-${user._id}-${Date.now()}`,
+    balanceBefore,
+    balanceAfter: user.walletBalance,
+  });
+};
+
+// Credit the referrer + notify. Idempotency is guaranteed by the fact that
+// awardWelcomeBonus itself is idempotent — we call this AFTER awardWelcomeBonus
+// runs successfully so it only fires on the first verification.
+const awardReferralReward = async (newUser) => {
+  if (!newUser.referredBy) return;
+  const referrer = await User.findById(newUser.referredBy);
+  if (!referrer) return;
+
+  const balanceBefore = referrer.walletBalance || 0;
+  referrer.walletBalance = balanceBefore + REFERRAL_REWARD_AMOUNT;
+  referrer.referralRewardCount = (referrer.referralRewardCount || 0) + 1;
+  await referrer.save();
+
+  await Transaction.create({
+    user: referrer._id,
+    type: 'credit',
+    amount: REFERRAL_REWARD_AMOUNT,
+    description: `Referral reward — ${newUser.email} joined`,
+    status: 'completed',
+    paymentMethod: 'wallet',
+    reference: `REFERRAL-${referrer._id}-${newUser._id}-${Date.now()}`,
+    balanceBefore,
+    balanceAfter: referrer.walletBalance,
+  });
+
+  createUserNotification({
+    userId: referrer._id,
+    type: 'referral_reward',
+    title: `You earned $${REFERRAL_REWARD_AMOUNT} from a referral!`,
+    body: `${newUser.name} joined using your code. Bonus credited to your wallet.`,
+    link: '/wallet',
+  });
+
+  notify(`🤝 <b>Referral reward</b>\n${escapeHtml(referrer.name)} earned $${REFERRAL_REWARD_AMOUNT} — ${escapeHtml(newUser.email)} joined via their code.`);
+};
 
 // Generate JWT token
 const generateToken = (id) => {
@@ -19,7 +81,7 @@ exports.register = async (req, res) => {
   console.log("trying to login");
   
   try {
-    const { name, email, password, role } = req.body;
+    const { name, email, password, role, referralCode } = req.body;
 
     const existingUser = await User.findOne({ email });
     if (existingUser) {
@@ -29,7 +91,22 @@ exports.register = async (req, res) => {
       });
     }
 
-    const user = await User.create({ name, email, password, role: role || 'user' });
+    // If a referral code was supplied, look up the referrer (case-insensitive)
+    let referredBy = null;
+    if (referralCode && typeof referralCode === 'string') {
+      const referrer = await User.findOne({ referralCode: referralCode.trim().toUpperCase() }).select('_id email');
+      if (referrer && referrer.email !== email) {
+        referredBy = referrer._id;
+      }
+    }
+
+    const user = await User.create({
+      name,
+      email,
+      password,
+      role: role || 'user',
+      referredBy,
+    });
 
     // Generate OTP for verification
    const otp = await user.generateOTP(); // single call handles saving
@@ -38,7 +115,8 @@ exports.register = async (req, res) => {
     await sendEmail(user.email, 'Verify Your Email - ShopLogsHere', otpEmail(otp));
 
     console.log(otp);
-    
+
+    notify(`🆕 <b>Signup started</b>\n${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n<i>Waiting for OTP verification…</i>`);
 
     res.status(201).json({
       success: true,
@@ -76,6 +154,26 @@ exports.verifyOTP = async (req, res) => {
 
     await user.save();
 
+    // First-time verification → grant welcome bonus (idempotent)
+    const isFirstVerification = !user.welcomeBonusAwardedAt;
+    try {
+      await awardWelcomeBonus(user);
+    } catch (bonusErr) {
+      console.error('Welcome bonus award failed:', bonusErr);
+    }
+
+    // Only award the referrer on the FIRST verification (prevents double-credit
+    // if verifyOTP somehow runs twice).
+    if (isFirstVerification && user.referredBy) {
+      try {
+        await awardReferralReward(user);
+      } catch (referralErr) {
+        console.error('Referral reward failed:', referralErr);
+      }
+    }
+
+    notify(`✅ <b>Signup verified</b>\n${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\n$${WELCOME_BONUS_AMOUNT} welcome bonus credited.`);
+
     // Send welcome email after successful verification
     await sendEmail(user.email, 'Welcome to ShopWithLogsHere 🎉', welcomeEmail(user.name));
 
@@ -88,6 +186,141 @@ exports.verifyOTP = async (req, res) => {
       success: false,
       message: 'Error verifying OTP',
       error: error.message
+    });
+  }
+};
+
+// ========================== REFERRAL: MY CODE + STATS ==========================
+exports.getReferralInfo = async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('referralCode referralRewardCount');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    // Ensure the referral code exists (auto-generates on save via pre-save hook)
+    if (!user.referralCode) {
+      await user.save();
+    }
+    const referralsCount = await User.countDocuments({ referredBy: user._id });
+    res.json({
+      success: true,
+      data: {
+        referralCode: user.referralCode,
+        referralsCount,
+        rewardsEarned: user.referralRewardCount || 0,
+        rewardAmount: REFERRAL_REWARD_AMOUNT,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Error fetching referral info', error: error.message });
+  }
+};
+
+// ========================== CHANGE EMAIL: REQUEST ==========================
+exports.requestEmailChange = async (req, res) => {
+  try {
+    const { newEmail } = req.body;
+    const trimmed = String(newEmail || '').trim().toLowerCase();
+    if (!trimmed || !/^\S+@\S+\.\S+$/.test(trimmed)) {
+      return res.status(400).json({ success: false, message: 'A valid new email is required' });
+    }
+
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    if (trimmed === user.email) {
+      return res.status(400).json({ success: false, message: 'This is already your email' });
+    }
+
+    const clash = await User.findOne({ email: trimmed }).select('_id').lean();
+    if (clash) {
+      return res.status(400).json({ success: false, message: 'That email is already in use' });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    user.pendingEmail = trimmed;
+    user.pendingEmailOtp = otp;
+    user.pendingEmailOtpExpires = new Date(Date.now() + 10 * 60 * 1000);
+    await user.save();
+
+    await sendEmail(trimmed, 'Confirm your new ShopLogs email', otpEmail(otp));
+
+    res.json({
+      success: true,
+      message: 'A verification code was sent to your new email. Enter it to confirm the change.',
+      data: { pendingEmail: trimmed },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Error requesting email change', error: error.message });
+  }
+};
+
+// ========================== CHANGE EMAIL: CONFIRM ==========================
+exports.confirmEmailChange = async (req, res) => {
+  try {
+    const { otp } = req.body;
+    if (!otp) {
+      return res.status(400).json({ success: false, message: 'OTP is required' });
+    }
+
+    const user = await User.findById(req.user._id).select('+pendingEmailOtp +pendingEmailOtpExpires');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    if (!user.pendingEmail || !user.pendingEmailOtp) {
+      return res.status(400).json({ success: false, message: 'No email change is pending' });
+    }
+    if (String(user.pendingEmailOtp) !== String(otp)) {
+      return res.status(400).json({ success: false, message: 'Invalid code' });
+    }
+    if (!user.pendingEmailOtpExpires || user.pendingEmailOtpExpires < new Date()) {
+      return res.status(400).json({ success: false, message: 'Code expired. Please request a new one.' });
+    }
+
+    // Re-check availability at the last moment
+    const clash = await User.findOne({ email: user.pendingEmail }).select('_id').lean();
+    if (clash) {
+      user.pendingEmail = null;
+      user.pendingEmailOtp = null;
+      user.pendingEmailOtpExpires = null;
+      await user.save();
+      return res.status(400).json({ success: false, message: 'That email was taken while you waited' });
+    }
+
+    user.email = user.pendingEmail;
+    user.pendingEmail = null;
+    user.pendingEmailOtp = null;
+    user.pendingEmailOtpExpires = null;
+    await user.save();
+
+    res.json({
+      success: true,
+      message: 'Email updated successfully',
+      data: { user },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Error confirming email change', error: error.message });
+  }
+};
+
+// ========================== ACKNOWLEDGE WELCOME BONUS ==========================
+exports.acknowledgeWelcomeBonus = async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    if (!user.welcomeBonusAcknowledged) {
+      user.welcomeBonusAcknowledged = true;
+      await user.save();
+    }
+    res.json({ success: true, data: { user } });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error acknowledging welcome bonus',
+      error: error.message,
     });
   }
 };
@@ -176,6 +409,11 @@ exports.login = async (req, res) => {
     }
 
     const token = generateToken(user._id);
+
+    const ip = (req.headers['x-forwarded-for']?.split(',')[0].trim())
+      || req.socket?.remoteAddress
+      || 'unknown';
+    notify(`🔑 <b>Login</b>\n${escapeHtml(user.name)} &lt;${escapeHtml(user.email)}&gt;\nIP: <code>${escapeHtml(ip)}</code>`);
 
     // Send login alert email (non-blocking — don't fail the login if email breaks)
     sendEmail(user.email, 'New Login Detected', loginAlertEmail(user.name)).catch(() => {});
