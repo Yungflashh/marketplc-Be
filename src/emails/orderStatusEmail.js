@@ -1,5 +1,5 @@
 // Email sent to a customer whenever their order status changes.
-// For 'cancelled' orders, includes the admin's rejection reason and refund note.
+// For 'cancelled' orders, includes the admin's rejection reason.
 
 const STATUS_LABELS = {
   pending: { label: 'Pending', color: '#6b7280', banner: '#f3f4f6', text: '#374151' },
@@ -9,7 +9,7 @@ const STATUS_LABELS = {
   cancelled: { label: 'Cancelled', color: '#dc2626', banner: '#fef2f2', text: '#991b1b' },
 };
 
-exports.orderStatusEmail = ({ name, orderNumber, oldStatus, newStatus, totalAmount, reason, refundAmount }) => {
+exports.orderStatusEmail = ({ name, orderNumber, oldStatus, newStatus, totalAmount, reason }) => {
   const style = STATUS_LABELS[newStatus] || STATUS_LABELS.pending;
   const oldLabel = STATUS_LABELS[oldStatus]?.label || oldStatus;
 
@@ -21,15 +21,7 @@ exports.orderStatusEmail = ({ name, orderNumber, oldStatus, newStatus, totalAmou
               </div>`
     : '';
 
-  const refundBlock = refundAmount
-    ? `
-              <div style="background-color:#ecfdf5;border:1px solid #a7f3d0;border-radius:10px;padding:18px 20px;margin-bottom:24px;">
-                <p style="margin:0 0 6px;font-size:12px;font-weight:700;color:#065f46;letter-spacing:0.06em;text-transform:uppercase;">Refund issued</p>
-                <p style="margin:0;font-size:14px;color:#064e3b;line-height:1.7;">
-                  <strong>$${Number(refundAmount).toFixed(2)}</strong> has been credited back to your wallet.
-                </p>
-              </div>`
-    : '';
+  const refundBlock = '';
 
   return `
 <!DOCTYPE html>

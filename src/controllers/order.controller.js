@@ -285,40 +285,8 @@ exports.updateOrderStatus = async (req, res) => {
       reason: status === 'cancelled' ? trimmedReason : '',
     });
 
-    // On cancellation, refund the wallet + restock inventory. Guarded by `refunded`
-    // so double-refunds can't happen even if this endpoint is hit twice.
-    let refundAmount = 0;
-    if (status === 'cancelled' && !order.refunded) {
-      const owner = await User.findById(order.user);
-      if (owner) {
-        const balanceBefore = owner.walletBalance || 0;
-        owner.walletBalance = balanceBefore + order.totalAmount;
-        await owner.save();
-
-        await Transaction.create({
-          user: owner._id,
-          type: 'credit',
-          amount: order.totalAmount,
-          description: `Refund for cancelled order ${order.orderNumber}`,
-          status: 'completed',
-          paymentMethod: 'wallet',
-          reference: `REFUND-${order.orderNumber}-${Date.now()}`,
-          balanceBefore,
-          balanceAfter: owner.walletBalance,
-          relatedOrder: order._id,
-        });
-
-        // Restock the products the cancelled order held
-        for (const item of order.items) {
-          await Product.findByIdAndUpdate(item.product, {
-            $inc: { quantity: item.quantity },
-          });
-        }
-
-        order.refunded = true;
-        refundAmount = order.totalAmount;
-      }
-    }
+    // Note: cancellation does NOT auto-refund the wallet or restock inventory.
+    // Admin handles refunds manually via /admin/wallet if warranted.
     await order.save();
 
     const populated = await Order.findById(order._id)
@@ -332,8 +300,7 @@ exports.updateOrderStatus = async (req, res) => {
     notify(
       `📦 <b>Order status</b>\n#${order.orderNumber}: ${escapeHtml(oldStatus)} → <b>${escapeHtml(status)}</b>\n` +
         `${escapeHtml(populated.user?.name || '')} · $${order.totalAmount.toFixed(2)}` +
-        (status === 'cancelled' ? `\nReason: ${escapeHtml(trimmedReason)}` : '') +
-        (refundAmount ? `\nRefunded: <b>$${refundAmount.toFixed(2)}</b>` : ''),
+        (status === 'cancelled' ? `\nReason: ${escapeHtml(trimmedReason)}` : ''),
       { severity, buttons }
     );
 
@@ -343,7 +310,7 @@ exports.updateOrderStatus = async (req, res) => {
       type: 'order_status',
       title: `Order #${order.orderNumber} is now ${status}`,
       body: status === 'cancelled'
-        ? `Cancelled — ${trimmedReason}${refundAmount ? ` · $${refundAmount.toFixed(2)} refunded to your wallet.` : ''}`
+        ? `Cancelled — ${trimmedReason}`
         : `Your order has moved from ${oldStatus} to ${status}.`,
       link: `/order/${order._id}`,
     });
@@ -361,7 +328,6 @@ exports.updateOrderStatus = async (req, res) => {
           newStatus: status,
           totalAmount: order.totalAmount,
           reason: status === 'cancelled' ? trimmedReason : '',
-          refundAmount,
         })
       ).catch(() => {}); // email.js already notifies Telegram on failure
     }
